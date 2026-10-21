@@ -1,0 +1,94 @@
+Written for: GitHub Copilot in VS Code on your work laptop, pasted in as two prompts.
+
+**What's going on:** the AI Store was built on the assumption that every `*.agent.md` file is a separate agent, and the sample repositories it was tested with even have two agents in one repository. Your Bitbucket project works differently: **one repository is one agent**, and its extra `.agent.md` files are probably helper agents the main one hands work to. So 84 repositories became 327 agents.
+
+**The fix:** show one agent per repository, using its **main** agent file, and treat the other files as part of that agent. The hard part is deciding which file is the main one, and I can't see your repositories. So the first prompt has Copilot **look at your real data and report back without changing anything**. The second prompt makes the change once you've confirmed the rule.
+
+**Prompt 1: investigate (no code changes)**
+```
+Read START_HERE.md and .github/copilot-instructions.md first. Don't change any code in this step.
+
+Problem: the AI Store shows 327 agents for a Bitbucket project of 84 repositories. In this project each
+repository is ONE agent, but a repository can hold several *.agent.md files. Today the sync
+(src/backend/base/langflow/ai_store/sync.py, sync_repo and _store_repo) stores every *.agent.md file as its own
+AIStoreAgent row.
+
+Investigate using the data the sync already stored. The app runs in Docker; query the database with:
+
+cd deploy/workbench
+docker compose exec -T langflow python - <<'EOF'
+import sqlite3, json, collections
+c = sqlite3.connect("/data/langflow.db")
+rows = c.execute("select repo_slug, path, name, frontmatter from ai_store_agent where removed = 0").fetchall()
+by_repo = collections.defaultdict(list)
+for slug, path, name, fm in rows:
+    fm = json.loads(fm) if fm else {}
+    by_repo[slug].append((path, name, fm.get("handoffs"), (fm.get("description") or "")[:80]))
+print(len(rows), "agent files in", len(by_repo), "repositories")
+counts = collections.Counter(len(v) for v in by_repo.values())
+print("files per repository:", sorted(counts.items()))
+for slug in sorted(by_repo, key=lambda s: -len(by_repo[s]))[:6]:
+    print("\n==", slug)
+    for item in sorted(by_repo[slug]): print("  ", item)
+for slug, info in c.execute("select slug, info from ai_store_repo where removed = 0 limit 6"):
+    print("\ninfo", slug, info)
+EOF
+
+(If LANGFLOW_DATABASE_URL points at PostgreSQL instead of SQLite, run the same queries there.)
+
+Then report to me, in plain words:
+1. How many repositories have 1, 2, 3... agent files.
+2. For the 6 repositories with the most files: every agent file path, its name, its description, and its
+   `handoffs` (if any).
+3. A rule that picks the ONE main agent file per repository, tested against all 84 repositories. Try these in
+   order and say which ones settle it:
+   a. AI_Store_Information.md in the repo root names it (store_info.py keeps every "Label:" section as metadata,
+      e.g. a "Main agent:" label).
+   b. The agent file that no other agent file in the repo lists in its `handoffs` (the entry point).
+   c. The only agent file in the repository root, or the only one in .github/agents/.
+   d. The agent file whose name matches the repository name or slug.
+4. The repositories where the rule doesn't give exactly one main file, listed by name.
+5. Whether the agent shown should be named after the repository or after the main file's frontmatter `name`.
+
+Stop after the report and wait for my answer.
+```
+
+**Prompt 2: make the change (after you've confirmed the rule and the naming)**
+```
+Implement one AI Store agent per repository, using the rule we agreed: <paste the rule, and the naming choice>.
+
+Requirements:
+- In src/backend/base/langflow/ai_store/sync.py, after parsing a repository's agent files, choose the main file
+  with the agreed rule and store ONLY that one as an AIStoreAgent row. Keep the other agent files' paths and
+  names in the repository's `info` JSON (AIStoreRepo.info) under "agent_files" and "main_agent", so no
+  database migration is needed. Rows for the other files must end up removed=True on the next sync (the
+  existing _store_repo logic marks paths that are no longer parsed as removed; keep that behaviour).
+- If a repository has no clear main file, still show one agent (pick deterministically: shortest path, then
+  alphabetical) and add a warning to that repository's `warnings`, so admins see it in the AI Store status.
+- Add a setting LANGFLOW_AI_STORE_AGENT_PER in src/backend/base/langflow/ai_store/settings.py with values
+  "repository" (new default) and "file" (today's behaviour), so the old behaviour can come back without code
+  changes. Add the line, with a comment, to deploy/workbench/workbench.env.example and onprem.env.
+- The bundled samples (src/backend/base/langflow/ai_store/samples/) have a repository with two agents
+  (requirements-agents). Update the samples and their README so they show the new behaviour, and keep one
+  test that covers "file" mode.
+- Tests: update src/backend/tests/unit/ai_store/test_sync_and_api.py and add tests for the rule: one row per
+  repository, the main file chosen correctly in each rule case, other files recorded in info, the warning for
+  an unclear repository, and "file" mode unchanged. Run:
+  uv run pytest src/backend/tests/unit/ai_store -q
+- Don't change the AI Store Agent component, the lock, or the frontend unless a test shows it's needed.
+- Update src/backend/base/langflow/ai_store/SETUP.md (how a repository becomes an agent, the main-file rule,
+  the new setting) and add a line to CHANGELOG.md under workbench-1.0.0, Changed.
+
+Then rebuild and re-sync:
+  cd deploy/workbench && docker compose up -d --build
+Sign in as admin, open a flow, AI Store tab, and run a sync (use the force option if there is one, or call
+POST /api/v1/ai-store/sync?force=true as admin). Confirm the AI Store now shows one agent per repository (84),
+and report any repositories that got the "no clear main file" warning.
+```
+
+**What to expect:**
+- After prompt 1, Copilot shows how your repositories are laid out and proposes a rule. **Check its list of unclear repositories before saying yes.** If it finds a clean answer, such as "the entry point is the file nobody hands off to", the rule settles itself.
+- After prompt 2 and a re-sync, you should see **84 agents**, one per repository. The extra files aren't deleted; they're marked as removed in the database and recorded on their repository.
+- If anything looks wrong, setting `LANGFLOW_AI_STORE_AGENT_PER=file` in `workbench.env` and restarting brings the old behaviour back without touching the code.
+
+If you send me Copilot's report from prompt 1, I can check the proposed rule before you go ahead.
