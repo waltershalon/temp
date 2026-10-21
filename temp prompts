@@ -92,3 +92,49 @@ and report any repositories that got the "no clear main file" warning.
 - If anything looks wrong, setting `LANGFLOW_AI_STORE_AGENT_PER=file` in `workbench.env` and restarting brings the old behaviour back without touching the code.
 
 If you send me Copilot's report from prompt 1, I can check the proposed rule before you go ahead.
+
+
+Implement one AI Store agent per repository, with these rules, in this order:
+1. A "Main agent:" label in the repository's AI_Store_Information.md decides. store_info.py already keeps
+   every "Label:" section as metadata. The value is either a path to one agent file, relative to the
+   repository root (match case-insensitively, and accept the bare file name if it's unique in the repo), or
+   the word "all", which means every agent file in the repository is shown as its own agent.
+2. If the repository has exactly one agent file, that file is the agent.
+3. If exactly one agent file's name (without .agent.md) matches the repository name or slug
+   (case-insensitive, ignoring spaces, hyphens and underscores), that file is the agent.
+4. Otherwise the repository is unresolved: show NO agent for it, and add this warning to the repository's
+   `warnings`, so admins see it in the AI Store status: "Several agent files and no main agent. Add a
+   'Main agent:' section to AI_Store_Information.md naming the file, or '- all' to show every file."
+   Also warn when a "Main agent:" label names a file that doesn't exist, and show no agent in that case.
+
+Implementation:
+- In src/backend/base/langflow/ai_store/sync.py, apply the rules after parsing a repository's agent files.
+  Store only the chosen file(s) as AIStoreAgent rows. Record every agent file path and the chosen one in
+  the repository's `info` JSON (AIStoreRepo.info) under "agent_files" and "main_agent" (null when
+  unresolved, "all" for collections). No database migration. Paths no longer chosen must become
+  removed=True on the next sync; the existing _store_repo logic does that, keep it.
+- Parse the "Main agent:" value in src/backend/base/langflow/ai_store/store_info.py (a small helper next to
+  the category parsing) rather than in sync.py.
+- Display: the agent's name stays its frontmatter `name` (or the file name if there's none). The repository
+  slug and name stay as they are on the agent row (repo_slug) and in the repo grouping.
+- Add LANGFLOW_AI_STORE_AGENT_PER in src/backend/base/langflow/ai_store/settings.py: "repository" (new
+  default, the rules above) or "file" (every agent file is an agent, today's behaviour). Add it, with a
+  one-line comment, to deploy/workbench/workbench.env.example and onprem.env.
+- Samples in src/backend/base/langflow/ai_store/samples/: give requirements-agents a "Main agent:" label,
+  add one sample repository labelled "- all" and one with two files and no label (unresolved), and update
+  samples/README.md.
+- Tests in src/backend/tests/unit/ai_store/: one row per resolved repository; each rule (label path, label
+  bare file name, label "all", single file, name match, unresolved hidden with the warning, label naming a
+  missing file); info JSON contents; rows of no-longer-chosen files become removed; "file" mode unchanged.
+  Update test_sync_and_api.py where it expects every file to be an agent. Run:
+  uv run pytest src/backend/tests/unit/ai_store -q
+- Don't change the AI Store Agent component, the lock or the frontend unless a test needs it.
+- Docs: src/backend/base/langflow/ai_store/SETUP.md gets a section "How a repository becomes an agent" with
+  the rules and both label examples. Add a line to CHANGELOG.md under workbench-1.0.0, Changed.
+
+Then rebuild and re-sync:
+  cd deploy/workbench && docker compose up -d --build
+As admin, run a forced sync (POST /api/v1/ai-store/sync?force=true, or the sync button in the AI Store tab).
+Report: how many agents are shown, which repositories resolved by which rule, and the list of unresolved
+repositories with their agent file paths. I'll send that list to the repository owners.
+
