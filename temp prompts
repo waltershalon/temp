@@ -1,140 +1,55 @@
-Written for: GitHub Copilot in VS Code on your work laptop, pasted in as two prompts.
+I need a read-only investigation of our IBM ELM / DOORS Next (DNG) setup, using our existing
+ELM MCP code in this workspace and the sandbox ELM it connects to.
 
-**What's going on:** the AI Store was built on the assumption that every `*.agent.md` file is a separate agent, and the sample repositories it was tested with even have two agents in one repository. Your Bitbucket project works differently: **one repository is one agent**, and its extra `.agent.md` files are probably helper agents the main one hands work to. So 84 repositories became 327 agents.
+RULES
+- Do NOT modify any code or files. Do not create, update or delete anything in ELM.
+- Only use HTTP GET/HEAD requests against ELM (login/auth POSTs through our existing client are fine).
+- Reuse our existing ELM client and its configured credentials. Never print credentials, tokens or cookies.
+- In your final report, REDACT: replace hostnames with HOST_A, HOST_B..., project/component/module
+  names with PROJECT_1, COMPONENT_1..., and never include requirement text.
+- For every answer give: the answer, the evidence (file + line in our code, or the endpoint pattern
+  + HTTP status), and confidence (confirmed / likely / unknown). If you cannot determine something,
+  say "unknown" and what would be needed. Do not guess.
 
-**The fix:** show one agent per repository, using its **main** agent file, and treat the other files as part of that agent. The hard part is deciding which file is the main one, and I can't see your repositories. So the first prompt has Copilot **look at your real data and report back without changing anything**. The second prompt makes the change once you've confirmed the rule.
+QUESTIONS
 
-**Prompt 1: investigate (no code changes)**
-```
-Read START_HERE.md and .github/copilot-instructions.md first. Don't change any code in this step.
+A. Our current implementation (from the code)
+1. Which auth flow actually succeeds against the sandbox: Basic, JAS form, or jauth token? Which
+   headers trigger each path?
+2. Which request headers we send (e.g. OSLC-Core-Version, DoorsRP-Request-Type, Accept,
+   Configuration-Context, X-Requested-With) and on which calls.
+3. How we pass configuration context: header, oslc_config.context query param, vvc.configuration,
+   or none. Do we use global configuration (GC) URIs, local RM stream URIs, or both?
+4. How we get module contents: generic OSLC query, a module/structure API, or reportable REST.
+   Give the endpoint patterns.
+5. Page sizes, timeouts and retry settings we use, and any pagination problems seen.
 
-Problem: the AI Store shows 327 agents for a Bitbucket project of 84 repositories. In this project each
-repository is ONE agent, but a repository can hold several *.agent.md files. Today the sync
-(src/backend/base/langflow/ai_store/sync.py, sync_repo and _store_repo) stores every *.agent.md file as its own
-AIStoreAgent row.
+B. The sandbox ELM server
+6. ELM version. Check rootservices, response headers, or any about/version endpoint.
+7. Fetch rootservices (jts and rm). List every service URL it advertises (RM catalog, JTS, GC /
+   oslc_config, LQE, Report Builder /rs, link index /ldx, link validity, friends), with hosts
+   redacted. This tells us the context roots and how many servers exist.
+8. Which projects are configuration-management enabled? Explain how you determined it.
+9. Is GC available? Roughly how many global streams/baselines exist (counts only)?
+10. Full-text search: does the DNG OSLC query capability accept oslc.searchTerms? Try one
+    harmless common word and report whether it returns results or an error (status + error
+    message only).
+11. Module structure API: is a dedicated module structure endpoint available? What does it
+    return (element names only, no content)?
+12. Module-context links: pick one artifact that is reused in two modules. Do its links differ
+    depending on module context? Show element/predicate names only.
+13. Link validity: is a link validity / suspect link service advertised or reachable?
+14. Link constraints: can project link constraints be read through any API? Which endpoint?
+15. RM to ETM links: pick an RM artifact that shows a "Validated By" link in the UI (if any).
+    Does that link appear in the RM artifact's own RDF, or only on the ETM side / via LDX?
+16. Is LQE or Report Builder reachable with our credentials? (status code only)
 
-Investigate using the data the sync already stored. The app runs in Docker; query the database with:
+C. Data shapes (for building test fixtures)
+17. For each of: rootservices, service provider catalog, one artifact, one module structure,
+    one link, describe the XML/RDF structure: root element, namespaces, key element/predicate
+    names, and how custom attributes appear (URI vs label). Replace ALL values with placeholders.
+    No real text, names or URLs.
 
-cd deploy/workbench
-docker compose exec -T langflow python - <<'EOF'
-import sqlite3, json, collections
-c = sqlite3.connect("/data/langflow.db")
-rows = c.execute("select repo_slug, path, name, frontmatter from ai_store_agent where removed = 0").fetchall()
-by_repo = collections.defaultdict(list)
-for slug, path, name, fm in rows:
-    fm = json.loads(fm) if fm else {}
-    by_repo[slug].append((path, name, fm.get("handoffs"), (fm.get("description") or "")[:80]))
-print(len(rows), "agent files in", len(by_repo), "repositories")
-counts = collections.Counter(len(v) for v in by_repo.values())
-print("files per repository:", sorted(counts.items()))
-for slug in sorted(by_repo, key=lambda s: -len(by_repo[s]))[:6]:
-    print("\n==", slug)
-    for item in sorted(by_repo[slug]): print("  ", item)
-for slug, info in c.execute("select slug, info from ai_store_repo where removed = 0 limit 6"):
-    print("\ninfo", slug, info)
-EOF
-
-(If LANGFLOW_DATABASE_URL points at PostgreSQL instead of SQLite, run the same queries there.)
-
-Then report to me, in plain words:
-1. How many repositories have 1, 2, 3... agent files.
-2. For the 6 repositories with the most files: every agent file path, its name, its description, and its
-   `handoffs` (if any).
-3. A rule that picks the ONE main agent file per repository, tested against all 84 repositories. Try these in
-   order and say which ones settle it:
-   a. AI_Store_Information.md in the repo root names it (store_info.py keeps every "Label:" section as metadata,
-      e.g. a "Main agent:" label).
-   b. The agent file that no other agent file in the repo lists in its `handoffs` (the entry point).
-   c. The only agent file in the repository root, or the only one in .github/agents/.
-   d. The agent file whose name matches the repository name or slug.
-4. The repositories where the rule doesn't give exactly one main file, listed by name.
-5. Whether the agent shown should be named after the repository or after the main file's frontmatter `name`.
-
-Stop after the report and wait for my answer.
-```
-
-**Prompt 2: make the change (after you've confirmed the rule and the naming)**
-```
-Implement one AI Store agent per repository, using the rule we agreed: <paste the rule, and the naming choice>.
-
-Requirements:
-- In src/backend/base/langflow/ai_store/sync.py, after parsing a repository's agent files, choose the main file
-  with the agreed rule and store ONLY that one as an AIStoreAgent row. Keep the other agent files' paths and
-  names in the repository's `info` JSON (AIStoreRepo.info) under "agent_files" and "main_agent", so no
-  database migration is needed. Rows for the other files must end up removed=True on the next sync (the
-  existing _store_repo logic marks paths that are no longer parsed as removed; keep that behaviour).
-- If a repository has no clear main file, still show one agent (pick deterministically: shortest path, then
-  alphabetical) and add a warning to that repository's `warnings`, so admins see it in the AI Store status.
-- Add a setting LANGFLOW_AI_STORE_AGENT_PER in src/backend/base/langflow/ai_store/settings.py with values
-  "repository" (new default) and "file" (today's behaviour), so the old behaviour can come back without code
-  changes. Add the line, with a comment, to deploy/workbench/workbench.env.example and onprem.env.
-- The bundled samples (src/backend/base/langflow/ai_store/samples/) have a repository with two agents
-  (requirements-agents). Update the samples and their README so they show the new behaviour, and keep one
-  test that covers "file" mode.
-- Tests: update src/backend/tests/unit/ai_store/test_sync_and_api.py and add tests for the rule: one row per
-  repository, the main file chosen correctly in each rule case, other files recorded in info, the warning for
-  an unclear repository, and "file" mode unchanged. Run:
-  uv run pytest src/backend/tests/unit/ai_store -q
-- Don't change the AI Store Agent component, the lock, or the frontend unless a test shows it's needed.
-- Update src/backend/base/langflow/ai_store/SETUP.md (how a repository becomes an agent, the main-file rule,
-  the new setting) and add a line to CHANGELOG.md under workbench-1.0.0, Changed.
-
-Then rebuild and re-sync:
-  cd deploy/workbench && docker compose up -d --build
-Sign in as admin, open a flow, AI Store tab, and run a sync (use the force option if there is one, or call
-POST /api/v1/ai-store/sync?force=true as admin). Confirm the AI Store now shows one agent per repository (84),
-and report any repositories that got the "no clear main file" warning.
-```
-
-**What to expect:**
-- After prompt 1, Copilot shows how your repositories are laid out and proposes a rule. **Check its list of unclear repositories before saying yes.** If it finds a clean answer, such as "the entry point is the file nobody hands off to", the rule settles itself.
-- After prompt 2 and a re-sync, you should see **84 agents**, one per repository. The extra files aren't deleted; they're marked as removed in the database and recorded on their repository.
-- If anything looks wrong, setting `LANGFLOW_AI_STORE_AGENT_PER=file` in `workbench.env` and restarting brings the old behaviour back without touching the code.
-
-If you send me Copilot's report from prompt 1, I can check the proposed rule before you go ahead.
-
-
-Implement one AI Store agent per repository, with these rules, in this order:
-1. A "Main agent:" label in the repository's AI_Store_Information.md decides. store_info.py already keeps
-   every "Label:" section as metadata. The value is either a path to one agent file, relative to the
-   repository root (match case-insensitively, and accept the bare file name if it's unique in the repo), or
-   the word "all", which means every agent file in the repository is shown as its own agent.
-2. If the repository has exactly one agent file, that file is the agent.
-3. If exactly one agent file's name (without .agent.md) matches the repository name or slug
-   (case-insensitive, ignoring spaces, hyphens and underscores), that file is the agent.
-4. Otherwise the repository is unresolved: show NO agent for it, and add this warning to the repository's
-   `warnings`, so admins see it in the AI Store status: "Several agent files and no main agent. Add a
-   'Main agent:' section to AI_Store_Information.md naming the file, or '- all' to show every file."
-   Also warn when a "Main agent:" label names a file that doesn't exist, and show no agent in that case.
-
-Implementation:
-- In src/backend/base/langflow/ai_store/sync.py, apply the rules after parsing a repository's agent files.
-  Store only the chosen file(s) as AIStoreAgent rows. Record every agent file path and the chosen one in
-  the repository's `info` JSON (AIStoreRepo.info) under "agent_files" and "main_agent" (null when
-  unresolved, "all" for collections). No database migration. Paths no longer chosen must become
-  removed=True on the next sync; the existing _store_repo logic does that, keep it.
-- Parse the "Main agent:" value in src/backend/base/langflow/ai_store/store_info.py (a small helper next to
-  the category parsing) rather than in sync.py.
-- Display: the agent's name stays its frontmatter `name` (or the file name if there's none). The repository
-  slug and name stay as they are on the agent row (repo_slug) and in the repo grouping.
-- Add LANGFLOW_AI_STORE_AGENT_PER in src/backend/base/langflow/ai_store/settings.py: "repository" (new
-  default, the rules above) or "file" (every agent file is an agent, today's behaviour). Add it, with a
-  one-line comment, to deploy/workbench/workbench.env.example and onprem.env.
-- Samples in src/backend/base/langflow/ai_store/samples/: give requirements-agents a "Main agent:" label,
-  add one sample repository labelled "- all" and one with two files and no label (unresolved), and update
-  samples/README.md.
-- Tests in src/backend/tests/unit/ai_store/: one row per resolved repository; each rule (label path, label
-  bare file name, label "all", single file, name match, unresolved hidden with the warning, label naming a
-  missing file); info JSON contents; rows of no-longer-chosen files become removed; "file" mode unchanged.
-  Update test_sync_and_api.py where it expects every file to be an agent. Run:
-  uv run pytest src/backend/tests/unit/ai_store -q
-- Don't change the AI Store Agent component, the lock or the frontend unless a test needs it.
-- Docs: src/backend/base/langflow/ai_store/SETUP.md gets a section "How a repository becomes an agent" with
-  the rules and both label examples. Add a line to CHANGELOG.md under workbench-1.0.0, Changed.
-
-Then rebuild and re-sync:
-  cd deploy/workbench && docker compose up -d --build
-As admin, run a forced sync (POST /api/v1/ai-store/sync?force=true, or the sync button in the AI Store tab).
-Report: how many agents are shown, which repositories resolved by which rule, and the list of unresolved
-repositories with their agent file paths. I'll send that list to the repository owners.
-
+OUTPUT
+A single markdown report with sections A, B, C, one numbered answer per question, in the format:
+**Answer** / **Evidence** / **Confidence**.
